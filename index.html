@@ -363,6 +363,28 @@ input:focus, select:focus, textarea:focus {
   .modal { border-radius: 22px; }
   .stat-grid { grid-template-columns: repeat(4, 1fr); }
 }
+
+.sync-card {
+  background: var(--bg-elevated); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 14px; margin-bottom: 14px; box-shadow: var(--shadow);
+}
+.sync-card h3 { margin: 0 0 8px; font-size: 16px; }
+.sync-card .hint { font-size: 12px; color: var(--text-secondary); margin: 0 0 10px; line-height: 1.55; }
+.sync-card .hint a { color: var(--primary-text); }
+.sync-status {
+  font-size: 13px; color: var(--text-secondary); margin: 8px 0 10px;
+  padding: 10px 12px; border-radius: 12px; background: var(--bg-soft);
+}
+.sync-status.ok { color: var(--income); }
+.sync-status.busy { color: var(--primary-text); }
+.sync-status.err { color: var(--danger); }
+.password-wrap { position: relative; }
+.password-wrap input { padding-right: 72px; }
+.password-wrap .linkish {
+  position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+  font-size: 12px; font-weight: 700; color: var(--primary-text); min-height: 36px; padding: 0 8px;
+}
+
 </style>
 </head>
 <body>
@@ -487,14 +509,37 @@ input:focus, select:focus, textarea:focus {
 
     <!-- TOOLS -->
     <section id="panel-tools" class="panel">
-      <div class="reminder">数据仅保存在本浏览器（localStorage）。换设备或清理缓存会丢失，请定期导出备份。</div>
+      <div class="reminder">未开启云同步时，数据仅保存在本浏览器。建议开启「云同步」或定期导出备份。</div>
+
+      <div class="sync-card" id="cloudSyncCard">
+        <h3>云同步</h3>
+        <p class="hint">
+          通过私有 GitHub Gist 在多设备间同步账本。请创建<strong>仅含 gist 权限</strong>的 Personal Access Token
+          （<a href="https://github.com/settings/tokens/new?scopes=gist&amp;description=expense-tracker" target="_blank" rel="noopener">点此创建</a>），
+          Token 只保存在本机 localStorage，不会出现在导出文件中。
+        </p>
+        <div class="form-grid">
+          <div class="password-wrap">
+            <input type="password" id="syncToken" placeholder="GitHub Token（gist 权限）" autocomplete="off" spellcheck="false">
+            <button type="button" class="linkish" id="toggleToken">显示</button>
+          </div>
+          <input type="text" id="syncGistId" placeholder="Gist ID" spellcheck="false">
+          <div class="sync-status" id="syncStatus">尚未配置云同步</div>
+          <div class="btn-row">
+            <button type="button" class="btn btn-secondary" id="saveSyncCfg">保存设置</button>
+            <button type="button" class="btn btn-primary" id="syncNowBtn">立即同步</button>
+          </div>
+          <button type="button" class="btn btn-secondary" id="clearSyncCfg">清除本机 Token</button>
+        </div>
+      </div>
+
       <div class="tools-list">
         <div class="tool-item">
           <div class="meta"><h3>导出 CSV</h3><p>UTF-8 BOM，Excel 可正确打开中文</p></div>
           <button class="btn btn-secondary" id="exportCsv" style="flex:0 0 auto">导出</button>
         </div>
         <div class="tool-item">
-          <div class="meta"><h3>导出 JSON 备份</h3><p>完整备份，含分类与预算设置</p></div>
+          <div class="meta"><h3>导出 JSON 备份</h3><p>完整备份，含分类与预算设置（不含 Token）</p></div>
           <button class="btn btn-secondary" id="exportJson" style="flex:0 0 auto">导出</button>
         </div>
         <div class="tool-item">
@@ -579,17 +624,22 @@ input:focus, select:focus, textarea:focus {
   'use strict';
 
   const STORAGE_KEY = 'expense-tracker-v1';
+  const SYNC_KEY = 'expense-tracker-sync-v1';
+  const DEFAULT_GIST_ID = '5c4adbfa0ec1c294f3a63854ff998ee0';
   const DEFAULT_EXPENSE_CATS = ['餐饮','交通','购物','日用','娱乐','居住','通讯','医疗','学习','人情','投资','其他'];
   const DEFAULT_INCOME_CATS = ['工资','兼职','副业','理财','其他'];
   const PIE_COLORS = ['#0f766e','#0284c7','#7c3aed','#db2777','#ea580c','#ca8a04','#16a34a','#0891b2','#4f46e5','#be123c','#65a30d','#9333ea','#0ea5e9','#f59e0b'];
 
-  /** @type {{entries: Array, expenseCategories: string[], incomeCategories: string[], monthlyBudgetFen: number|null}} */
+  /** @type {{entries: Array, expenseCategories: string[], incomeCategories: string[], monthlyBudgetFen: number|null, deleted: string[], updatedAt: number}} */
   let state = loadState();
   let currentType = 'expense';
   let selectedCategory = DEFAULT_EXPENSE_CATS[0];
   let editingId = null;
   let pendingDeleteId = null;
   let statsRange = 'week';
+  let syncing = false;
+  let syncTimer = null;
+  let pendingSync = false;
 
   const $ = (sel, root=document) => root.querySelector(sel);
   const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
@@ -607,18 +657,51 @@ input:focus, select:focus, textarea:focus {
     };
   }
 
+  function toMs(v) {
+    if (v == null || v === '') return 0;
+    if (typeof v === 'number') return v;
+    const n = Number(v);
+    if (Number.isFinite(n) && String(v).trim() !== '' && !String(v).includes('-')) return n;
+    const t = Date.parse(v);
+    return Number.isFinite(t) ? t : 0;
+  }
+
+  function normalizeLocalEntry(e) {
+    if (!e || !e.id) return null;
+    let amountFen = e.amountFen;
+    if (amountFen == null && typeof e.amount === 'number') amountFen = e.amount;
+    if (typeof amountFen !== 'number') return null;
+    return {
+      id: String(e.id),
+      type: e.type === 'income' ? 'income' : 'expense',
+      amountFen: amountFen,
+      category: e.category || '其他',
+      note: e.note || '',
+      date: e.date,
+      time: e.time || '',
+      createdAt: toMs(e.createdAt) || Date.now(),
+      updatedAt: toMs(e.updatedAt) || toMs(e.createdAt) || Date.now(),
+      source: e.source || 'web'
+    };
+  }
+
   function loadState() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (!raw) return defaultState();
       const parsed = JSON.parse(raw);
+      const entries = (Array.isArray(parsed.entries) ? parsed.entries : []).map(normalizeLocalEntry).filter(Boolean);
+      const deleted = Array.isArray(parsed.deleted) ? parsed.deleted.map(String) : [];
+      const delSet = new Set(deleted);
       return {
-        entries: Array.isArray(parsed.entries) ? parsed.entries : [],
+        entries: entries.filter(e => !delSet.has(e.id)),
         expenseCategories: Array.isArray(parsed.expenseCategories) && parsed.expenseCategories.length
           ? parsed.expenseCategories : DEFAULT_EXPENSE_CATS.slice(),
         incomeCategories: Array.isArray(parsed.incomeCategories) && parsed.incomeCategories.length
           ? parsed.incomeCategories : DEFAULT_INCOME_CATS.slice(),
-        monthlyBudgetFen: typeof parsed.monthlyBudgetFen === 'number' ? parsed.monthlyBudgetFen : null
+        monthlyBudgetFen: typeof parsed.monthlyBudgetFen === 'number' ? parsed.monthlyBudgetFen : null,
+        deleted: Array.from(new Set(deleted)),
+        updatedAt: toMs(parsed.updatedAt) || Date.now()
       };
     } catch (e) {
       console.warn('loadState failed', e);
@@ -631,12 +714,258 @@ input:focus, select:focus, textarea:focus {
       entries: [],
       expenseCategories: DEFAULT_EXPENSE_CATS.slice(),
       incomeCategories: DEFAULT_INCOME_CATS.slice(),
-      monthlyBudgetFen: null
+      monthlyBudgetFen: null,
+      deleted: [],
+      updatedAt: Date.now()
     };
   }
 
-  function saveState() {
+  function saveState(opts) {
+    state.updatedAt = Date.now();
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    if (!opts || opts.sync !== false) scheduleSync();
+  }
+
+  function loadSyncConfig() {
+    try {
+      const raw = localStorage.getItem(SYNC_KEY);
+      if (!raw) return { token: '', gistId: DEFAULT_GIST_ID, lastSyncAt: 0, lastError: '' };
+      const p = JSON.parse(raw);
+      return {
+        token: p.token || '',
+        gistId: p.gistId || DEFAULT_GIST_ID,
+        lastSyncAt: p.lastSyncAt || 0,
+        lastError: p.lastError || ''
+      };
+    } catch (e) {
+      return { token: '', gistId: DEFAULT_GIST_ID, lastSyncAt: 0, lastError: '' };
+    }
+  }
+
+  function saveSyncConfig(cfg) {
+    const clean = {
+      token: cfg.token || '',
+      gistId: (cfg.gistId || DEFAULT_GIST_ID).trim(),
+      lastSyncAt: cfg.lastSyncAt || 0,
+      lastError: cfg.lastError || ''
+    };
+    localStorage.setItem(SYNC_KEY, JSON.stringify(clean));
+    return clean;
+  }
+
+  function formatSyncTime(ms) {
+    if (!ms) return '尚未同步';
+    const d = new Date(ms);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function setSyncStatus(kind, text) {
+    const el = $('#syncStatus');
+    if (!el) return;
+    el.className = 'sync-status' + (kind ? ' ' + kind : '');
+    el.textContent = text;
+  }
+
+  function refreshSyncStatusUI() {
+    const cfg = loadSyncConfig();
+    if (!cfg.token) {
+      setSyncStatus('', '尚未配置云同步');
+      return;
+    }
+    if (cfg.lastError) {
+      setSyncStatus('err', '上次失败：' + cfg.lastError + (cfg.lastSyncAt ? ' · 上次成功 ' + formatSyncTime(cfg.lastSyncAt) : ''));
+      return;
+    }
+    if (cfg.lastSyncAt) setSyncStatus('ok', '上次同步：' + formatSyncTime(cfg.lastSyncAt) + '（上海时区）');
+    else setSyncStatus('', '已保存 Token，等待首次同步');
+  }
+
+  function stateToGistDoc(st) {
+    return {
+      version: 1,
+      updatedAt: new Date(st.updatedAt || Date.now()).toISOString(),
+      entries: st.entries.map(e => ({
+        id: e.id,
+        type: e.type,
+        category: e.category,
+        amount: e.amountFen,
+        note: e.note || '',
+        date: e.date,
+        time: e.time || '',
+        createdAt: e.createdAt,
+        updatedAt: e.updatedAt,
+        source: e.source || 'web'
+      })),
+      categories: {
+        expense: st.expenseCategories.slice(),
+        income: st.incomeCategories.slice()
+      },
+      budget: st.monthlyBudgetFen,
+      deleted: (st.deleted || []).slice()
+    };
+  }
+
+  function gistDocToState(doc) {
+    const deleted = Array.from(new Set((doc.deleted || []).map(String)));
+    const delSet = new Set(deleted);
+    const cats = doc.categories || {};
+    const expenseCategories = Array.isArray(cats.expense) && cats.expense.length ? cats.expense.slice()
+      : (Array.isArray(doc.expenseCategories) && doc.expenseCategories.length ? doc.expenseCategories.slice() : DEFAULT_EXPENSE_CATS.slice());
+    const incomeCategories = Array.isArray(cats.income) && cats.income.length ? cats.income.slice()
+      : (Array.isArray(doc.incomeCategories) && doc.incomeCategories.length ? doc.incomeCategories.slice() : DEFAULT_INCOME_CATS.slice());
+    let budget = doc.budget;
+    if (budget == null && typeof doc.monthlyBudgetFen === 'number') budget = doc.monthlyBudgetFen;
+    const entries = (doc.entries || []).map(e => normalizeLocalEntry({
+      id: e.id,
+      type: e.type,
+      amountFen: typeof e.amount === 'number' ? e.amount : e.amountFen,
+      category: e.category,
+      note: e.note,
+      date: e.date,
+      time: e.time,
+      createdAt: e.createdAt,
+      updatedAt: e.updatedAt,
+      source: e.source
+    })).filter(Boolean).filter(e => !delSet.has(e.id));
+    return {
+      entries,
+      expenseCategories,
+      incomeCategories,
+      monthlyBudgetFen: typeof budget === 'number' ? budget : null,
+      deleted,
+      updatedAt: toMs(doc.updatedAt) || Date.now()
+    };
+  }
+
+  function mergeStates(local, remote) {
+    const deleted = Array.from(new Set([...(local.deleted || []), ...(remote.deleted || [])]));
+    const delSet = new Set(deleted);
+    const map = new Map();
+    [...remote.entries, ...local.entries].forEach(e => {
+      if (!e || delSet.has(e.id)) return;
+      const prev = map.get(e.id);
+      if (!prev || toMs(e.updatedAt) >= toMs(prev.updatedAt)) map.set(e.id, e);
+    });
+    deleted.forEach(id => map.delete(id));
+    const expenseCategories = Array.from(new Set([...(remote.expenseCategories || []), ...(local.expenseCategories || [])]));
+    const incomeCategories = Array.from(new Set([...(remote.incomeCategories || []), ...(local.incomeCategories || [])]));
+    const monthlyBudgetFen = toMs(local.updatedAt) >= toMs(remote.updatedAt) ? local.monthlyBudgetFen : remote.monthlyBudgetFen;
+    return {
+      entries: Array.from(map.values()),
+      expenseCategories,
+      incomeCategories,
+      monthlyBudgetFen,
+      deleted,
+      updatedAt: Math.max(toMs(local.updatedAt), toMs(remote.updatedAt), Date.now())
+    };
+  }
+
+  function docsEqualForSync(a, b) {
+    const norm = (s) => JSON.stringify({
+      entries: (s.entries || []).map(e => ({
+        id: e.id, type: e.type, amountFen: e.amountFen, category: e.category,
+        note: e.note || '', date: e.date, time: e.time || '',
+        updatedAt: toMs(e.updatedAt), source: e.source || ''
+      })).sort((x,y) => x.id < y.id ? -1 : 1),
+      expenseCategories: (s.expenseCategories || []).slice().sort(),
+      incomeCategories: (s.incomeCategories || []).slice().sort(),
+      monthlyBudgetFen: s.monthlyBudgetFen,
+      deleted: (s.deleted || []).slice().sort()
+    });
+    return norm(a) === norm(b);
+  }
+
+  async function githubFetchGist(token, gistId) {
+    const res = await fetch('https://api.github.com/gists/' + encodeURIComponent(gistId), {
+      headers: {
+        'Accept': 'application/vnd.github+json',
+        'Authorization': 'Bearer ' + token,
+        'X-GitHub-Api-Version': '2022-11-28'
+      }
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      throw new Error('拉取失败 HTTP ' + res.status + (t ? ': ' + t.slice(0, 120) : ''));
+    }
+    const data = await res.json();
+    const f = data.files && data.files['expense-data.json'];
+    if (!f) return gistDocToState({ version: 1, entries: [], deleted: [], categories: { expense: DEFAULT_EXPENSE_CATS, income: DEFAULT_INCOME_CATS }, budget: null });
+    let content = f.content;
+    if (f.truncated || !content) {
+      const raw = await fetch(f.raw_url, {
+        headers: { 'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github.raw' }
+      });
+      if (!raw.ok) throw new Error('拉取 raw 失败 HTTP ' + raw.status);
+      content = await raw.text();
+    }
+    return gistDocToState(JSON.parse(content));
+  }
+
+  async function githubPatchGist(token, gistId, st) {
+    const doc = stateToGistDoc(st);
+    const res = await fetch('https://api.github.com/gists/' + encodeURIComponent(gistId), {
+      method: 'PATCH',
+      headers: {
+        'Accept': 'application/vnd.github+json',
+        'Authorization': 'Bearer ' + token,
+        'X-GitHub-Api-Version': '2022-11-28',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({ files: { 'expense-data.json': { content: JSON.stringify(doc, null, 2) + '\n' } } })
+    });
+    if (!res.ok) {
+      const t = await res.text();
+      throw new Error('推送失败 HTTP ' + res.status + (t ? ': ' + t.slice(0, 120) : ''));
+    }
+  }
+
+  function scheduleSync() {
+    pendingSync = true;
+    clearTimeout(scheduleSync._t);
+    scheduleSync._t = setTimeout(() => { syncNow({ quiet: true }); }, 400);
+  }
+
+  async function syncNow(opts) {
+    const quiet = opts && opts.quiet;
+    const cfg = loadSyncConfig();
+    if (!cfg.token || !cfg.gistId) {
+      if (!quiet) setSyncStatus('', '请先填写 Token 与 Gist ID 并保存');
+      return;
+    }
+    if (syncing) { pendingSync = true; return; }
+    if (!navigator.onLine) {
+      setSyncStatus('err', '当前离线，稍后再同步');
+      return;
+    }
+    syncing = true;
+    pendingSync = false;
+    setSyncStatus('busy', '同步中…');
+    try {
+      const remote = await githubFetchGist(cfg.token, cfg.gistId);
+      const merged = mergeStates(state, remote);
+      const changedLocally = !docsEqualForSync(merged, state);
+      const needPush = !docsEqualForSync(merged, remote);
+      state = merged;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      if (needPush) await githubPatchGist(cfg.token, cfg.gistId, state);
+      cfg.lastSyncAt = Date.now();
+      cfg.lastError = '';
+      saveSyncConfig(cfg);
+      if (changedLocally) renderAll();
+      setSyncStatus('ok', '上次同步：' + formatSyncTime(cfg.lastSyncAt) + '（上海时区）');
+      if (!quiet) toast(needPush ? '云同步完成（已上传）' : '云同步完成');
+    } catch (err) {
+      const msg = (err && err.message) ? err.message : String(err);
+      cfg.lastError = msg;
+      saveSyncConfig(cfg);
+      setSyncStatus('err', '同步失败：' + msg);
+      if (!quiet) toast('同步失败');
+      console.warn('sync failed', err);
+    } finally {
+      syncing = false;
+      if (pendingSync) scheduleSync();
+    }
   }
 
   /** Parse yuan string/number to integer fen. Returns null if invalid. */
@@ -821,12 +1150,14 @@ input:focus, select:focus, textarea:focus {
       note,
       date,
       time,
-      updatedAt: Date.now()
+      updatedAt: Date.now(),
+      source: 'web'
     };
     if (editingId) {
       const i = state.entries.findIndex(x => x.id === editingId);
       if (i >= 0) {
         payload.createdAt = state.entries[i].createdAt || Date.now();
+        payload.source = state.entries[i].source || 'web';
         state.entries[i] = payload;
       } else {
         payload.createdAt = Date.now();
@@ -838,6 +1169,8 @@ input:focus, select:focus, textarea:focus {
       state.entries.unshift(payload);
       toast('已记一笔');
     }
+    // undelete if id was tombstoned
+    state.deleted = (state.deleted || []).filter(id => id !== payload.id);
     saveState();
     closeEntryModal();
     renderAll();
@@ -850,7 +1183,10 @@ input:focus, select:focus, textarea:focus {
 
   function doDelete() {
     if (!pendingDeleteId) return;
-    state.entries = state.entries.filter(e => e.id !== pendingDeleteId);
+    const id = pendingDeleteId;
+    state.entries = state.entries.filter(e => e.id !== id);
+    if (!state.deleted) state.deleted = [];
+    if (!state.deleted.includes(id)) state.deleted.push(id);
     saveState();
     pendingDeleteId = null;
     $('#confirmModal').classList.remove('open');
@@ -863,7 +1199,7 @@ input:focus, select:focus, textarea:focus {
     return list.slice().sort((a, b) => {
       const da = a.date + 'T' + (a.time || '00:00');
       const db = b.date + 'T' + (b.time || '00:00');
-      if (da === db) return (b.createdAt || 0) - (a.createdAt || 0);
+      if (da === db) return toMs(b.createdAt) - toMs(a.createdAt);
       return da < db ? 1 : -1;
     });
   }
@@ -1241,7 +1577,12 @@ input:focus, select:focus, textarea:focus {
     const payload = {
       version: 1,
       exportedAt: new Date().toISOString(),
-      ...state
+      entries: state.entries,
+      expenseCategories: state.expenseCategories,
+      incomeCategories: state.incomeCategories,
+      monthlyBudgetFen: state.monthlyBudgetFen,
+      deleted: state.deleted || [],
+      updatedAt: state.updatedAt
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     downloadBlob(`记账本备份_${nowLocalParts().date}.json`, blob);
@@ -1256,11 +1597,12 @@ input:focus, select:focus, textarea:focus {
         const incoming = Array.isArray(data.entries) ? data.entries : [];
         const byId = new Map(state.entries.map(e => [e.id, e]));
         let added = 0, updated = 0;
-        incoming.forEach(e => {
-          if (!e || !e.id || typeof e.amountFen !== 'number') return;
+        incoming.forEach(raw => {
+          const e = normalizeLocalEntry(raw);
+          if (!e) return;
           if (byId.has(e.id)) {
             const old = byId.get(e.id);
-            if ((e.updatedAt || e.createdAt || 0) >= (old.updatedAt || old.createdAt || 0)) {
+            if (toMs(e.updatedAt) >= toMs(old.updatedAt)) {
               byId.set(e.id, e);
               updated++;
             }
@@ -1269,15 +1611,27 @@ input:focus, select:focus, textarea:focus {
             added++;
           }
         });
-        state.entries = Array.from(byId.values());
+        if (Array.isArray(data.deleted)) {
+          state.deleted = Array.from(new Set([...(state.deleted || []), ...data.deleted.map(String)]));
+        }
+        const delSet = new Set(state.deleted || []);
+        state.entries = Array.from(byId.values()).filter(e => !delSet.has(e.id));
         if (Array.isArray(data.expenseCategories)) {
           state.expenseCategories = Array.from(new Set([...state.expenseCategories, ...data.expenseCategories]));
+        }
+        if (data.categories && Array.isArray(data.categories.expense)) {
+          state.expenseCategories = Array.from(new Set([...state.expenseCategories, ...data.categories.expense]));
         }
         if (Array.isArray(data.incomeCategories)) {
           state.incomeCategories = Array.from(new Set([...state.incomeCategories, ...data.incomeCategories]));
         }
+        if (data.categories && Array.isArray(data.categories.income)) {
+          state.incomeCategories = Array.from(new Set([...state.incomeCategories, ...data.categories.income]));
+        }
         if (typeof data.monthlyBudgetFen === 'number') {
           state.monthlyBudgetFen = data.monthlyBudgetFen;
+        } else if (typeof data.budget === 'number') {
+          state.monthlyBudgetFen = data.budget;
         }
         saveState();
         renderAll();
@@ -1390,6 +1744,46 @@ input:focus, select:focus, textarea:focus {
     $('.manage-cats details').open = true;
   });
 
+  // Sync settings UI
+  (function initSyncUI() {
+    const cfg = loadSyncConfig();
+    $('#syncToken').value = cfg.token || '';
+    $('#syncGistId').value = cfg.gistId || DEFAULT_GIST_ID;
+    refreshSyncStatusUI();
+  })();
+
+  $('#toggleToken').addEventListener('click', () => {
+    const input = $('#syncToken');
+    const show = input.type === 'password';
+    input.type = show ? 'text' : 'password';
+    $('#toggleToken').textContent = show ? '隐藏' : '显示';
+  });
+  $('#saveSyncCfg').addEventListener('click', () => {
+    const cfg = loadSyncConfig();
+    cfg.token = ($('#syncToken').value || '').trim();
+    cfg.gistId = ($('#syncGistId').value || '').trim() || DEFAULT_GIST_ID;
+    cfg.lastError = '';
+    saveSyncConfig(cfg);
+    toast('云同步设置已保存');
+    refreshSyncStatusUI();
+    syncNow({ quiet: false });
+  });
+  $('#clearSyncCfg').addEventListener('click', () => {
+    const gistId = ($('#syncGistId').value || DEFAULT_GIST_ID).trim();
+    saveSyncConfig({ token: '', gistId, lastSyncAt: 0, lastError: '' });
+    $('#syncToken').value = '';
+    refreshSyncStatusUI();
+    toast('已清除本机 Token');
+  });
+  $('#syncNowBtn').addEventListener('click', () => syncNow({ quiet: false }));
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') syncNow({ quiet: true });
+  });
+  window.addEventListener('focus', () => syncNow({ quiet: true }));
+  window.addEventListener('online', () => syncNow({ quiet: true }));
+  syncTimer = setInterval(() => syncNow({ quiet: true }), 60000);
+
   // Init dates for stats custom
   const parts = nowLocalParts();
   $('#statsFrom').value = parts.date.slice(0, 8) + '01';
@@ -1397,6 +1791,8 @@ input:focus, select:focus, textarea:focus {
 
   fillSearchCategories();
   renderAll();
+  // first sync if configured
+  setTimeout(() => syncNow({ quiet: true }), 300);
 })();
 </script>
 </body>
