@@ -420,6 +420,386 @@ def cmd_pull(args: argparse.Namespace) -> None:
     print(f"已拉取 {len(doc['entries'])} 笔，CSV → {CSV_PATH}")
 
 
+
+# ---------------------------------------------------------------------------
+# 账单导入框架：每个来源实现一个 parser -> List[BillRow]，其余逻辑（跳过规则、
+# 分类、去重、合并、写回）共用。后续 import-alipay 只需新增 parse_alipay_* 并注册。
+# ---------------------------------------------------------------------------
+import re
+import zipfile
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
+
+
+@dataclass
+class BillRow:
+    when: datetime            # 交易时间（上海时区，naive 即视为本地）
+    kind: str                 # 交易类型
+    counterparty: str         # 交易对方
+    product: str              # 商品
+    direction: str            # 收/支 原文：收入 / 支出 / /
+    amount_fen: int
+    method: str               # 支付方式
+    status: str               # 当前状态
+    txn_id: str               # 交易单号
+    remark: str = ""
+    raw_index: int = 0
+
+
+@dataclass
+class ImportReport:
+    imported: list = field(default_factory=list)
+    skipped: list = field(default_factory=list)      # (row, reason)
+    already: list = field(default_factory=list)      # rows already in gist / tombstoned
+    dups: list = field(default_factory=list)         # (row, existing entry)
+    uncertain: list = field(default_factory=list)    # (entry, reason)
+
+
+_NS = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+
+
+def read_xlsx_rows(path: str | Path) -> list[list[Any]]:
+    """极简 xlsx 读取（仅标准库）：返回第一个工作表的二维数组；日期序列号保留为 float。"""
+    with zipfile.ZipFile(path) as z:
+        shared: list[str] = []
+        if "xl/sharedStrings.xml" in z.namelist():
+            root = ET.fromstring(z.read("xl/sharedStrings.xml"))
+            for si in root.findall("m:si", _NS):
+                shared.append("".join(t.text or "" for t in si.iter(f"{{{_NS['m']}}}t")))
+        # 第一个 sheet
+        wb = ET.fromstring(z.read("xl/workbook.xml"))
+        rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+        first = wb.find("m:sheets/m:sheet", _NS)
+        rid = first.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+        target = None
+        for r in rels:
+            if r.get("Id") == rid:
+                target = r.get("Target")
+        target = target.lstrip("/")
+        if not target.startswith("xl/"):
+            target = "xl/" + target
+        sheet = ET.fromstring(z.read(target))
+    rows: list[list[Any]] = []
+    for row in sheet.iter(f"{{{_NS['m']}}}row"):
+        cells: dict[int, Any] = {}
+        for c in row.findall("m:c", _NS):
+            ref = c.get("r", "")
+            letters = "".join(ch for ch in ref if ch.isalpha())
+            col = 0
+            for ch in letters:
+                col = col * 26 + (ord(ch.upper()) - 64)
+            t = c.get("t")
+            v = c.find("m:v", _NS)
+            if t == "s" and v is not None:
+                val: Any = shared[int(v.text)]
+            elif t == "inlineStr":
+                val = "".join(x.text or "" for x in c.iter(f"{{{_NS['m']}}}t"))
+            elif t in ("str", "b", "e"):
+                val = v.text if v is not None else None
+            elif v is not None and v.text is not None:
+                try:
+                    f = float(v.text)
+                    val = int(f) if f.is_integer() and "." not in v.text and "E" not in v.text.upper() else f
+                except ValueError:
+                    val = v.text
+            else:
+                val = None
+            cells[col - 1] = val
+        if cells:
+            width = max(cells) + 1
+            rows.append([cells.get(i) for i in range(width)])
+        else:
+            rows.append([])
+    return rows
+
+
+def read_table_file(path: str | Path) -> list[list[Any]]:
+    path = Path(path)
+    if path.suffix.lower() in (".xlsx", ".xlsm"):
+        return read_xlsx_rows(path)
+    for enc in ("utf-8-sig", "gb18030"):
+        try:
+            with path.open(encoding=enc, newline="") as fp:
+                return [list(r) for r in csv.reader(fp)]
+        except UnicodeDecodeError:
+            continue
+    raise SystemExit(f"无法读取文件编码: {path}")
+
+
+def excel_serial_to_dt(v: float) -> datetime:
+    return datetime(1899, 12, 30) + timedelta(days=float(v))
+
+
+def parse_dt(v: Any) -> datetime:
+    if isinstance(v, datetime):
+        return v
+    if isinstance(v, (int, float)):
+        return excel_serial_to_dt(v).replace(microsecond=0)
+    s = str(v).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+    raise ValueError(f"无法解析时间: {v}")
+
+
+def money_to_fen(v: Any) -> int:
+    if isinstance(v, (int, float)):
+        return int(round(float(v) * 100))
+    s = str(v or "").strip().replace("¥", "").replace("￥", "").replace(",", "")
+    return yuan_to_fen(s) if s else 0
+
+
+def find_header(rows: list[list[Any]], required: list[str]) -> tuple[int, dict[str, int]]:
+    for i, r in enumerate(rows[:60]):
+        cells = [str(c).strip() if c is not None else "" for c in r]
+        if all(any(cell == k for cell in cells) for k in required):
+            return i, {cell: j for j, cell in enumerate(cells) if cell}
+    raise SystemExit(f"未找到表头（需要列: {', '.join(required)}）")
+
+
+def _cell(r: list[Any], idx: dict[str, int], *names: str) -> Any:
+    for n in names:
+        j = idx.get(n)
+        if j is not None and j < len(r):
+            return r[j]
+    return None
+
+
+def _txt(v: Any) -> str:
+    if v is None:
+        return ""
+    s = str(v).strip()
+    return "" if s == "/" else s
+
+
+def parse_wechat(path: str | Path) -> tuple[list[BillRow], str]:
+    rows = read_table_file(path)
+    h, idx = find_header(rows, ["交易时间", "交易类型", "交易对方", "收/支", "当前状态", "交易单号"])
+    period = ""
+    for r in rows[:h]:
+        line = " ".join(str(c) for c in r if c)
+        m = re.search(r"起始时间：\[(.+?)\].*终止时间：\[(.+?)\]", line)
+        if m:
+            period = f"{m.group(1)} ~ {m.group(2)}"
+    out: list[BillRow] = []
+    for k, r in enumerate(rows[h + 1:], start=h + 2):
+        if not r or _cell(r, idx, "交易时间") in (None, ""):
+            continue
+        out.append(BillRow(
+            when=parse_dt(_cell(r, idx, "交易时间")),
+            kind=_txt(_cell(r, idx, "交易类型")),
+            counterparty=_txt(_cell(r, idx, "交易对方")),
+            product=_txt(_cell(r, idx, "商品")),
+            direction=str(_cell(r, idx, "收/支") or "").strip(),
+            amount_fen=money_to_fen(_cell(r, idx, "金额(元)", "金额（元）", "金额")),
+            method=_txt(_cell(r, idx, "支付方式")),
+            status=_txt(_cell(r, idx, "当前状态")),
+            txn_id=str(_cell(r, idx, "交易单号") or "").strip(),
+            remark=_txt(_cell(r, idx, "备注")),
+            raw_index=k,
+        ))
+    return out, period
+
+
+# 中性/内部转移 关键字（出现在 交易类型 / 交易对方 / 商品）
+NEUTRAL_KEYWORDS = ["零钱提现", "零钱充值", "零钱通", "理财通", "信用卡还款", "转入零钱", "转出零钱",
+                    "余额宝", "余利宝", "转账到银行卡", "提现", "充值-零钱"]
+SKIP_STATUS = ["失败", "已关闭", "已全额退款", "对方已退还", "已撤销", "已退回", "交易关闭", "退款成功"]
+
+EXPENSE_RULES: list[tuple[str, list[str]]] = [
+    ("居住", ["电费", "水费", "燃气", "房租", "物业", "生活缴费", "暖气", "宽带"]),
+    ("通讯", ["话费", "流量", "中国移动", "中国联通", "中国电信", "手机充值"]),
+    ("交通", ["充电", "滴滴", "嘀嗒", "地铁", "公交", "加油", "停车", "ETCP", "高德打车", "曹操", "T3出行",
+             "12306", "铁路", "华铁", "高速", "顺风车", "出行", "打车", "哈啰", "青桔", "中石化", "中石油"]),
+    ("医疗", ["药房", "药店", "医院", "诊所", "大药房", "医疗", "体检"]),
+    ("学习", ["书店", "课程", "教育", "培训", "知识", "得到", "极客"]),
+    ("娱乐", ["电影", "影城", "KTV", "游戏", "沐浴", "洗浴", "足浴", "体育", "健身", "网吧", "景区", "门票", "演出", "腾讯视频", "爱奇艺", "B站"]),
+    ("餐饮", ["美团", "饿了么", "餐", "饭", "面", "咖啡", "coffee", "奶茶", "茶饮", "肯德基", "KFC", "麦当劳",
+             "汉堡", "汤", "烧肉", "烤", "火锅", "小厨", "食堂", "智盘", "bakery", "面包", "蛋糕", "手抓饼",
+             "海鲜", "果", "泡菜", "瑞幸", "星巴克", "喜茶", "蜜雪", "丹香", "饺", "粥", "包子", "早点", "7-ELEVEn", "便利"]),
+    ("日用", ["超市", "便利店", "生活用品", "日用", "洗衣", "华兴"]),
+    ("购物", ["淘宝", "天猫", "京东", "拼多多", "唯品会", "抖音电商", "得物", "闲鱼", "商城"]),
+]
+INCOME_RULES: list[tuple[str, list[str]]] = [
+    ("工资", ["工资", "薪", "代发"]),
+    ("理财", ["收益", "利息", "理财", "基金"]),
+    ("兼职", ["兼职"]),
+    ("副业", ["稿费", "副业", "佣金"]),
+]
+PERSON_NAME_RE = re.compile(r"^[\u4e00-\u9fa5]{1,4}$")
+
+
+def categorize(row: BillRow, typ: str) -> tuple[str, str | None]:
+    """返回 (分类, 不确定原因或 None)。"""
+    hay = f"{row.counterparty} {row.product} {row.kind}"
+    if typ == "income":
+        for cat, kws in INCOME_RULES:
+            if any(k.lower() in hay.lower() for k in kws):
+                return cat, None
+        if "红包" in row.kind or "转账" in row.kind:
+            return "其他", None
+        return "其他", "收入未匹配关键词"
+    if "红包" in row.kind or row.kind in ("转账", "群收款"):
+        return "人情", None
+    for cat, kws in EXPENSE_RULES:
+        if any(k.lower() in hay.lower() for k in kws):
+            return cat, None
+    # 个人收款码（菜市场/小摊）：多为早餐、买菜
+    if row.kind == "扫二维码付款" or "二维码收款" in row.product or PERSON_NAME_RE.match(row.counterparty or ""):
+        return "餐饮", "个人收款码，按小摊/早餐推测"
+    return "其他", "未匹配关键词"
+
+
+def short_note(row: BillRow) -> str:
+    cp = row.counterparty
+    prod = row.product
+    if not prod or prod == cp or "二维码收款" in prod or prod.startswith("商户单号"):
+        prod = ""
+    prod = re.sub(r"(美团/大众点评点餐订单)-\d+", r"\1", prod)
+    prod = re.sub(r"_?[A-Z]*WX\d{10,}", "", prod)
+    prod = prod.replace(cp, "").strip(" -_")
+    note = cp + (f" · {prod}" if prod else "")
+    return note[:40]
+
+
+def partial_refund_fen(status: str) -> int:
+    m = re.search(r"已退款[（(]?\s*[￥¥]?\s*([\d.,]+)", status or "")
+    return money_to_fen(m.group(1)) if m else 0
+
+
+def bill_rows_to_entries(rows: list[BillRow], source: str, id_prefix: str, report: ImportReport) -> list[dict]:
+    entries = []
+    ts = now_iso()
+    for row in rows:
+        hay = f"{row.kind} {row.counterparty} {row.product}"
+        if row.direction not in ("收入", "支出"):
+            report.skipped.append((row, "中性交易（收/支为 /）"))
+            continue
+        if any(k in hay for k in NEUTRAL_KEYWORDS):
+            report.skipped.append((row, "中性/自有账户间转移"))
+            continue
+        if any(k in row.status for k in SKIP_STATUS):
+            report.skipped.append((row, f"状态：{row.status}"))
+            continue
+        if row.direction == "收入" and (row.kind.endswith("-退款") or "退款" in row.kind):
+            report.skipped.append((row, "退款入账（已在原支出中处理）"))
+            continue
+        amount = row.amount_fen
+        refund = partial_refund_fen(row.status)
+        if refund:
+            amount -= refund
+            if amount <= 0:
+                report.skipped.append((row, f"退款后金额为 0（{row.status}）"))
+                continue
+        typ = "expense" if row.direction == "支出" else "income"
+        cat, why = categorize(row, typ)
+        e = {
+            "id": f"{id_prefix}-{row.txn_id}",
+            "type": typ,
+            "category": cat,
+            "amount": amount,
+            "note": short_note(row) + (f"（已扣退款¥{fen_to_yuan(refund)}）" if refund else ""),
+            "date": row.when.strftime("%Y-%m-%d"),
+            "time": row.when.strftime("%H:%M"),
+            "createdAt": ts,
+            "updatedAt": ts,
+            "source": source,
+        }
+        if why:
+            report.uncertain.append((e, why))
+        entries.append(e)
+    return entries
+
+
+def run_import(args: argparse.Namespace, parser_fn, source: str, id_prefix: str) -> None:
+    src = Path(args.file)
+    if not src.exists():
+        raise SystemExit(f"文件不存在: {src}")
+    rows, period = parser_fn(src)
+    report = ImportReport()
+    candidates = bill_rows_to_entries(rows, source, id_prefix, report)
+
+    token = get_token()
+    remote = pull_gist(token, args.gist)
+    existing_ids = {e["id"] for e in remote["entries"]}
+    tomb = set(remote["deleted"])
+    manual = [e for e in remote["entries"] if e.get("source") != source]
+
+    to_add = []
+    for e in candidates:
+        if e["id"] in existing_ids or e["id"] in tomb:
+            report.already.append(e)
+            continue
+        dup = next((m for m in manual if m["date"] == e["date"] and m["amount"] == e["amount"] and m["type"] == e["type"]), None)
+        if dup and not args.allow_dups:
+            report.dups.append((e, dup))
+            continue
+        to_add.append(e)
+    report.imported = to_add
+    report.uncertain = [(e, w) for e, w in report.uncertain if e in to_add]
+
+    print(f"来源：{source}  文件：{src.name}")
+    if period:
+        print(f"账单区间：{period}")
+    print(f"账单行数 {len(rows)}；可导入 {len(candidates)}；新增 {len(to_add)}；已存在 {len(report.already)}；"
+          f"疑似重复 {len(report.dups)}；跳过 {len(report.skipped)}")
+
+    exp = sum(e["amount"] for e in to_add if e["type"] == "expense")
+    inc = sum(e["amount"] for e in to_add if e["type"] == "income")
+    print(f"新增支出 ¥{fen_to_yuan(exp)} · 新增收入 ¥{fen_to_yuan(inc)}")
+    by_cat: dict[tuple[str, str], int] = {}
+    for e in to_add:
+        by_cat[(e["type"], e["category"])] = by_cat.get((e["type"], e["category"]), 0) + e["amount"]
+    for (t, c), v in sorted(by_cat.items(), key=lambda x: (x[0][0] != "expense", -x[1])):
+        n = sum(1 for e in to_add if e["type"] == t and e["category"] == c)
+        print(f"  {'支出' if t == 'expense' else '收入'} {c}: ¥{fen_to_yuan(v)}（{n} 笔）")
+    top = sorted([e for e in to_add if e["type"] == "expense"], key=lambda e: -e["amount"])[:5]
+    if top:
+        print("最大 5 笔支出：")
+        for e in top:
+            print(f"  {e['date']} {e['note']}  ¥{fen_to_yuan(e['amount'])}  [{e['category']}]")
+    if report.skipped:
+        print("跳过：")
+        for row, why in report.skipped:
+            print(f"  {row.when:%Y-%m-%d %H:%M} {row.direction} ¥{fen_to_yuan(row.amount_fen)} {row.counterparty} — {why}")
+    if report.dups:
+        print("疑似与已有手工记录重复（未导入，可加 --allow-dups）：")
+        for e, m in report.dups:
+            print(f"  {e['date']} ¥{fen_to_yuan(e['amount'])} {e['note']}  ≈  [{m['id']}] {m.get('note')}")
+    if report.uncertain:
+        print("分类不确定：")
+        for e, why in report.uncertain:
+            print(f"  {e['date']} {e['note']} ¥{fen_to_yuan(e['amount'])} → {e['category']}（{why}）")
+
+    if args.dry_run:
+        print("（dry-run，未写入）")
+        return
+    if not to_add:
+        print("没有新记录需要写入")
+        write_csv_mirror(remote)
+        return
+    for e in to_add:
+        key = e["type"]
+        if e["category"] not in remote["categories"][key]:
+            remote["categories"][key].append(e["category"])
+    local = {**remote, "entries": to_add, "deleted": [], "updatedAt": now_iso()}
+    merged = merge_docs(local, remote)
+    push_gist(token, args.gist, merged)
+    write_csv_mirror(merged)
+    print(f"已写入 Gist：共 {len(merged['entries'])} 笔；CSV → {CSV_PATH}")
+
+
+def cmd_import_wechat(args: argparse.Namespace) -> None:
+    run_import(args, parse_wechat, source="微信账单", id_prefix="wx")
+
+
+# 预留：支付宝账单（CSV，GBK，表头含 交易时间/交易分类/交易对方/商品说明/收/支/金额/交易状态/交易订单号）
+# def parse_alipay(path): ...  -> list[BillRow]
+# def cmd_import_alipay(args): run_import(args, parse_alipay, source="支付宝账单", id_prefix="ali")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="记账本 Gist CLI")
     p.add_argument("--gist", default=os.environ.get("EXPENSE_GIST_ID", GIST_ID_DEFAULT), help="Gist ID")
@@ -451,6 +831,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     pull = sub.add_parser("pull", help="拉取并刷新本地 CSV")
     pull.set_defaults(func=cmd_pull)
+
+    iw = sub.add_parser("import-wechat", help="导入微信支付账单（xlsx/csv）")
+    iw.add_argument("file")
+    iw.add_argument("--dry-run", action="store_true", help="只预览，不写入")
+    iw.add_argument("--allow-dups", action="store_true", help="与手工记录同日同额也导入")
+    iw.set_defaults(func=cmd_import_wechat)
     return p
 
 
